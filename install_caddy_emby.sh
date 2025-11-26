@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ====================================================
-#  Caddy Reverse Proxy for Emby - V4 (Loop Menu)
+#  Caddy Reverse Proxy for Emby - V4 (Fixed)
 #  Author: AiLi1337
 # ====================================================
 
@@ -19,7 +19,7 @@ log() { echo -e "${GREEN}[Info]${PLAIN} $1"; }
 warn() { echo -e "${YELLOW}[Warning]${PLAIN} $1"; }
 error() { echo -e "${RED}[Error]${PLAIN} $1"; }
 
-# 1. 安装基础环境 (确保有 netstat/ss)
+# 1. 安装基础环境
 install_base() {
     log "正在检查并安装基础组件..."
     if [ -f /etc/debian_version ]; then
@@ -35,7 +35,6 @@ check_port() {
     echo -e "${SKYBLUE}正在查询 80 和 443 端口占用情况...${PLAIN}"
     echo -e "------------------------------------------------"
     
-    # 优先使用 netstat，如果不存在则使用 ss
     if command -v netstat &> /dev/null; then
         netstat -tunlp | grep -E ":80|:443"
     else
@@ -61,12 +60,10 @@ kill_port() {
     systemctl stop httpd 2>/dev/null
     log "已停止 Apache"
 
-    # 杀掉占用 80 和 443 的所有进程
     if command -v fuser &> /dev/null; then
         fuser -k 80/tcp 2>/dev/null
         fuser -k 443/tcp 2>/dev/null
     else
-        # 备用方案
         killall -9 caddy 2>/dev/null
         killall -9 nginx 2>/dev/null
         killall -9 httpd 2>/dev/null
@@ -82,7 +79,7 @@ install_caddy() {
         warn "Caddy 已安装。"
     else
         log "正在安装 Caddy..."
-        install_base # 确保基础组件已安装
+        install_base
         if [ -f /etc/debian_version ]; then
             apt install -y debian-keyring debian-archive-keyring apt-transport-https
             curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
@@ -117,14 +114,12 @@ configure_caddy() {
         warn "使用默认地址: $EMBY_ADDRESS"
     fi
 
-    # 备份旧配置
     if [ -f /etc/caddy/Caddyfile ]; then
         cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak.$(date +%F_%H%M%S)
     fi
 
     log "正在生成配置文件..."
 
-    # 写入配置 (包含 Host 透传，解决 HTTPS 反代 404 问题)
     cat > /etc/caddy/Caddyfile <<EOF
 $DOMAIN {
     encode gzip
@@ -134,8 +129,6 @@ $DOMAIN {
         header_up X-Real-IP {remote_host}
         header_up X-Forwarded-For {remote_host}
         header_up X-Forwarded-Proto {scheme}
-        
-        # 强制将 Host 头修改为上游地址 (关键修改)
         header_up Host {upstream_hostport}
     }
 }
@@ -143,7 +136,6 @@ EOF
 
     log "配置已写入，正在重启 Caddy..."
     
-    # 重启前尝试清理下自身进程，防止卡死
     killall -9 caddy 2>/dev/null
     systemctl restart caddy
     
@@ -164,7 +156,7 @@ EOF
 show_menu() {
     clear
     echo -e "#################################################"
-    echo -e "#    Caddy + Emby 一键反代脚本 (V4 Loop)        #"
+    echo -e "#    Caddy + Emby 一键反代脚本 (V4 Fixed)       #"
     echo -e "#################################################"
     echo -e " ${GREEN}1.${PLAIN} 安装环境 & Caddy"
     echo -e " ${GREEN}2.${PLAIN} 配置反代 (输入域名/IP)"
@@ -179,7 +171,8 @@ show_menu() {
     echo -e ""
     read -p " 请输入数字 [0-7]: " num < /dev/tty
 
-    case "$num" 在
+    # 这里的 in 千万不要改成中文的 在
+    case "$num" in
         1) install_base; install_caddy ;;
         2) install_base; configure_caddy ;;
         3) systemctl stop caddy; log "服务已停止" ;;
