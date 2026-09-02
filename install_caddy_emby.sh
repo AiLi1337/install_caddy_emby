@@ -61,7 +61,7 @@ Caddy + Emby 反代管理脚本 V${SCRIPT_VERSION}
   --delete DOMAIN[:PORT] --yes      删除指定站点（自动化必须显式 --yes）
   --reload                          校验并重载（或启动）Caddy
   --stop                            停止 Caddy
-  --uninstall --yes                 归档后完整卸载 Caddy 和脚本内容
+  --uninstall --yes                 归档后卸载 Caddy 和脚本内容（保留未确认归属的数据）
   --version                         显示版本
   -h, --help                        显示帮助
 
@@ -1096,6 +1096,7 @@ reject_wildcard_cors() {
             line = $0
             gsub(/[";,]/, "", line)
             line = tolower(line)
+            if (line ~ /^[[:space:]]*match[[:space:]]+header[[:space:]]+access-control-allow-origin[[:space:]]+\*[[:space:]]*$/) next
             if (line ~ /(^|[[:space:]])[+-]?access-control-allow-origin[[:space:]]*([:=][[:space:]]*)?[[:space:]]*\*/) {
                 found = 1
             }
@@ -1227,11 +1228,25 @@ restore_service_state() {
 restore_caddyfile_from_backup() {
     local backup="$1"
     local restored
+    local restore_failed=false
 
     [[ -f "$backup" && ( ! -e "$CADDYFILE" || -f "$CADDYFILE" ) && ! -L "$CADDYFILE" ]] || return 1
-    restored=$(mktemp "$CADDY_DIR/.Caddyfile.restore.XXXXXX") || return 1
+    if ! restored=$(mktemp "$CADDY_DIR/.Caddyfile.restore.XXXXXX"); then
+        if [[ -e "$CADDYFILE" ]] && ! rm -f "$CADDYFILE"; then
+            error "无法清除失败的新 Caddyfile：$CADDYFILE"
+        fi
+        return 1
+    fi
     if ! cp -p "$backup" "$restored" || ! chmod 644 "$restored" || ! mv "$restored" "$CADDYFILE"; then
-        rm -f "$restored"
+        restore_failed=true
+    fi
+    if [[ "$restore_failed" == true ]]; then
+        if [[ -e "$restored" ]] && ! rm -f "$restored"; then
+            error "无法清理回滚临时文件：$restored"
+        fi
+        if [[ -e "$CADDYFILE" ]] && ! rm -f "$CADDYFILE"; then
+            error "无法清除失败的新 Caddyfile：$CADDYFILE"
+        fi
         return 1
     fi
 }
@@ -1258,13 +1273,11 @@ apply_candidate() {
         return 1
     fi
 
-    if [[ "$stop_when_empty" != true ]]; then
-        validate_caddyfile "$candidate" || {
-            rm -f "$candidate"
-            error "候选配置验证失败，未修改正式 Caddyfile。"
-            return 1
-        }
-    fi
+    validate_caddyfile "$candidate" || {
+        rm -f "$candidate"
+        error "候选配置验证失败，未修改正式 Caddyfile。"
+        return 1
+    }
 
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet caddy; then
         was_active=true
@@ -1306,21 +1319,25 @@ apply_candidate() {
     fi
 
     if [[ "$had_config" == true && -f "$backup" ]]; then
-        if ! validate_caddyfile_syntax "$backup" >/dev/null 2>&1; then
-            error "备份配置本身验证失败：$backup"
-            error "为避免加载未知配置，已保持 Caddy 停止；请人工恢复并检查。"
-            command -v systemctl >/dev/null 2>&1 && systemctl stop caddy >/dev/null 2>&1 || true
-            return 1
-        fi
         if ! restore_caddyfile_from_backup "$backup"; then
             error "恢复备份配置失败：$backup"
-            error "已保持 Caddy 停止；请人工恢复 $backup。"
+            error "已保持 Caddy 停止；请检查并人工恢复 $backup。"
             command -v systemctl >/dev/null 2>&1 && systemctl stop caddy >/dev/null 2>&1 || true
             return 1
         fi
         log "已恢复备份配置：$backup"
+        if ! validate_caddyfile_syntax "$CADDYFILE" >/dev/null 2>&1; then
+            error "已恢复的旧配置验证失败：$CADDYFILE"
+            error "已保持 Caddy 停止，请人工检查旧配置。"
+            command -v systemctl >/dev/null 2>&1 && systemctl stop caddy >/dev/null 2>&1 || true
+            return 1
+        fi
     else
-        rm -f "$CADDYFILE"
+        if ! rm -f "$CADDYFILE"; then
+            error "无法删除失败的新 Caddyfile，已保持 Caddy 停止；请人工删除或恢复 $CADDYFILE。"
+            command -v systemctl >/dev/null 2>&1 && systemctl stop caddy >/dev/null 2>&1 || true
+            return 1
+        fi
     fi
 
     if ! restore_service_state "$was_active"; then
@@ -1346,9 +1363,12 @@ print_config_block() {
 $domain {
     encode gzip
 
+    header -Access-Control-Allow-Origin {
+        match header Access-Control-Allow-Origin *
+    }
+
     reverse_proxy $backend {
 $host_header
-        header_down -Access-Control-Allow-Origin
         header_up X-Real-IP {remote_host}
     }
 }
@@ -1919,15 +1939,13 @@ cleanup_caddy_files() {
     fi
     for path in "$CADDY_DIR"/.caddy-emby-manager-Caddyfile.bak.* "$CADDY_DIR"/.Caddyfile.candidate.* \
         "$CADDY_DIR"/.Caddyfile.without.* "$CADDY_DIR"/.Caddyfile.delete.* \
-        "$CADDY_DIR"/.Caddyfile.restore.* "$CADDY_DIR/.caddy-emby-manager.lock"; do
+        "$CADDY_DIR"/.Caddyfile.restore.*; do
         [[ -f "$path" && ! -L "$path" ]] || continue
         rm -f "$path" || result=1
     done
-    if find "$CADDY_DIR" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then
+    if find "$CADDY_DIR" -mindepth 1 -maxdepth 1 ! -name .caddy-emby-manager.lock -print -quit 2>/dev/null | grep -q .; then
         warn "Caddy 配置目录中存在未管理文件，保留目录：$CADDY_DIR"
         result=1
-    else
-        rmdir "$CADDY_DIR" 2>/dev/null || result=1
     fi
     return "$result"
 }
@@ -1942,7 +1960,8 @@ cleanup_caddy_data() {
         return 1
     fi
     [[ -d "$CADDY_DATA_DIR" ]] || return 0
-    rm -rf "$CADDY_DATA_DIR"
+    warn "Caddy 数据目录归属无法由脚本确认，卸载时保留：$CADDY_DATA_DIR"
+    return 0
 }
 
 cleanup_manager_state() {
@@ -2102,7 +2121,7 @@ uninstall_caddy_locked() {
     local package_removed=false
     local cleanup_result=0
 
-    echo -e "${RED}完整卸载会先归档 /etc/caddy 和 /var/lib/caddy，再停止并移除 Caddy。${PLAIN}"
+    echo -e "${RED}卸载会先归档 /etc/caddy 和 /var/lib/caddy，再停止并移除 Caddy；未确认归属的数据目录会保留。${PLAIN}"
     if ! confirm_action "确认完整卸载吗?"; then
         log "已取消卸载。"
         return 1
@@ -2216,6 +2235,8 @@ uninstall_caddy_locked() {
 }
 
 uninstall_caddy() {
+    # Keep the lock pathname stable. Removing it after releasing flock can
+    # race with another process that has already opened and locked the file.
     with_config_lock uninstall_caddy_locked "$@"
 }
 
