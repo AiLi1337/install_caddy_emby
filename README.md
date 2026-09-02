@@ -269,18 +269,6 @@ ss -ltnp | awk '$4 ~ /:(80|443)$/ { print }'
 - 脚本不提供 Cloudflare API、WAF、限流、IP 黑名单、后台路径保护或多后端负载均衡配置。
 - `--skip-upstream-check` 只跳过预检，不会关闭 Caddy 的上游 TLS 证书校验。
 
-## 测试
-
-仓库包含隔离回归测试，使用伪造的 `caddy` 和 `systemctl`，不会修改真实系统服务：
-
-```bash
-bash -n install_caddy_emby.sh
-bash -n tests/test_install_caddy_emby.sh
-bash tests/test_install_caddy_emby.sh
-```
-
-测试覆盖候选配置校验失败、reload 失败回滚、服务状态恢复、CORS 限制、IPv4/IPv6 端口检测、域名和端口边界、多域名块处理、HTTPS 上游 Host 头、卸载路径保护以及命令行安装入口。
-
 ## 许可证
 
 MIT License
