@@ -38,7 +38,25 @@
 
 ## 快速开始
 
-### 1. 下载并检查脚本
+### 一行启动面板
+
+复制下面这一整行到服务器执行，即可下载脚本并打开管理面板：
+
+<!-- markdownlint-disable MD013 -->
+
+```bash
+curl -fL --retry 3 https://raw.githubusercontent.com/AiLi1337/caddy_emby/main/install_caddy_emby.sh -o caddy_emby.sh && sudo bash ./caddy_emby.sh
+```
+
+<!-- markdownlint-enable MD013 -->
+
+脚本会保存到当前目录。首次运行后，若快捷命令注册成功，以后直接输入
+`c` 即可再次打开面板。
+
+这条命令没有使用 `curl | bash`：远程内容会先落盘为普通文件，脚本才能安全地
+注册快捷命令。若希望运行前先阅读代码，请使用下一种方式。
+
+### 下载、检查后运行
 
 不要把远程脚本直接管道传给 root shell。先保存、检查，再执行：
 
@@ -53,7 +71,7 @@ chmod 755 caddy_emby.sh
 sudo bash ./caddy_emby.sh
 ```
 
-### 2. 按菜单部署
+### 按菜单部署
 
 推荐顺序：
 
@@ -68,7 +86,7 @@ sudo bash ./caddy_emby.sh
 `/usr/local/bin/caddy_emby.sh` 或 `/usr/local/bin/c` 已被其他程序使用，
 脚本会保留它们并给出警告。
 
-### 3. 使用命令行部署
+### 使用命令行部署
 
 本地 Emby：
 
