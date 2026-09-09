@@ -1,7 +1,7 @@
 # Caddy + Emby 反向代理管理脚本
 
 [![Language](https://img.shields.io/badge/Language-Bash-2f855a.svg)](install_caddy_emby.sh)
-[![Version](https://img.shields.io/badge/Version-V5.4-e67e22.svg)](install_caddy_emby.sh)
+[![Version](https://img.shields.io/badge/Version-V5.4.1-e67e22.svg)](install_caddy_emby.sh)
 [![License](https://img.shields.io/badge/License-MIT-2563eb.svg)](LICENSE)
 
 用一台能够访问 Emby 源站的 Linux 服务器，为客户端提供稳定的 HTTPS 反向代理入口。脚本负责安装 Caddy、签发证书、管理多站点配置，并在失败时尽量恢复原状态。
@@ -231,6 +231,11 @@ sudo bash /usr/local/bin/caddy_emby.sh --reload
 
 归档可能包含 TLS 私钥，请按敏感数据保护。脚本只卸载由自身记录为已安装的 Caddy 包；预先存在或归属无法确认的包、配置和数据会保留。
 
+## V5.4.1 热修复
+
+- 修复删除唯一托管站点时，空候选 Caddyfile 被 `caddy validate` 拒绝的问题。
+- 删除最后一个站点后，脚本会写入可验证的无站点占位配置，并停止 Caddy 服务。
+
 ## V5.4 变化
 
 - 不再删除上游 CORS 响应头，避免破坏 Emby Web 客户端和跨域 API 行为。
@@ -244,7 +249,7 @@ sudo bash /usr/local/bin/caddy_emby.sh --reload
 
 ## 已验证项目
 
-V5.4 已在 Debian 12 与 Caddy `v2.11.4` 上进行真实远程部署测试：
+V5.4.1 已在 Debian 12 与 Caddy `v2.11.4` 上进行真实远程部署测试：
 
 | 项目 | 结果 |
 | --- | --- |

@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 
 # ====================================================
-#  Caddy Reverse Proxy for Emby - V5.4
+#  Caddy Reverse Proxy for Emby - V5.4.1
 #  CADDY-EMBY-MANAGER-MANAGED-SCRIPT
 #  Multi-site manager with validation and rollback
 # ====================================================
 
-SCRIPT_VERSION="5.4"
+SCRIPT_VERSION="5.4.1"
 SCRIPT_DEST="/usr/local/bin/caddy_emby.sh"
 SHORTCUT="/usr/local/bin/c"
 CADDY_DIR="/etc/caddy"
 CADDYFILE="$CADDY_DIR/Caddyfile"
+INITIAL_CADDYFILE_COMMENT='# Caddy Emby manager: add a site with --configure before starting Caddy.'
 CADDY_DATA_DIR="/var/lib/caddy"
 LOG_FILE="/var/log/caddy-emby-manager.log"
 LOG_MAX_BYTES=5242880
@@ -437,7 +438,7 @@ ensure_caddyfile_exists() {
         return 1
     }
     temporary=$(mktemp "$CADDY_DIR/.Caddyfile.initial.XXXXXX") || return 1
-    if ! printf '# Caddy Emby manager: add a site with --configure before starting Caddy.\n' > "$temporary" || \
+    if ! printf '%s\n' "$INITIAL_CADDYFILE_COMMENT" > "$temporary" || \
         ! chmod 644 "$temporary" || ! mv "$temporary" "$CADDYFILE"; then
         rm -f "$temporary"
         error "无法创建初始 Caddyfile。"
@@ -1786,7 +1787,7 @@ delete_site_locked() {
     local without_old
     local remaining=0
     local source_status
-    local after_content
+    local stop_after_delete=false
 
     domain=$(canonicalize_site_address "$1") || {
         error "站点地址格式无效。"
@@ -1841,8 +1842,19 @@ delete_site_locked() {
         [[ -n "$domain" ]] && ((remaining += 1))
     done < <(list_configured_domains "$candidate")
 
-    after_content=$(grep -q '[^[:space:]]' "$candidate" 2>/dev/null; echo $?)
-    if ((remaining == 0 && after_content != 0)); then
+    if ((remaining == 0)); then
+        if ! grep -q '[^[:space:]]' "$candidate" 2>/dev/null || \
+            is_initial_managed_caddyfile "$candidate"; then
+            stop_after_delete=true
+        fi
+    fi
+
+    if [[ "$stop_after_delete" == true ]]; then
+        if ! printf '%s\n' "$INITIAL_CADDYFILE_COMMENT" > "$candidate"; then
+            rm -f "$candidate"
+            error "无法写入无站点占位配置。"
+            return 1
+        fi
         if apply_candidate "$candidate" true; then
             log "域名配置删除完成。"
             return 0
@@ -2214,7 +2226,7 @@ is_initial_managed_caddyfile() {
 
     [[ -f "$file" && ! -L "$file" ]] || return 1
     [[ "$(wc -l < "$file" 2>/dev/null)" =~ ^[[:space:]]*1[[:space:]]*$ ]] || return 1
-    grep -Fqx '# Caddy Emby manager: add a site with --configure before starting Caddy.' "$file" 2>/dev/null
+    grep -Fqx "$INITIAL_CADDYFILE_COMMENT" "$file" 2>/dev/null
 }
 
 cleanup_caddy_files() {
