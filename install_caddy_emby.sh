@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 
 # ====================================================
-#  Caddy Reverse Proxy for Emby - V5.3
+#  Caddy Reverse Proxy for Emby - V5.4
 #  CADDY-EMBY-MANAGER-MANAGED-SCRIPT
 #  Multi-site manager with validation and rollback
 # ====================================================
 
-SCRIPT_VERSION="5.3"
+SCRIPT_VERSION="5.4"
 SCRIPT_DEST="/usr/local/bin/caddy_emby.sh"
 SHORTCUT="/usr/local/bin/c"
 CADDY_DIR="/etc/caddy"
@@ -25,7 +25,11 @@ APT_KEYRING_WAS_PRESENT="$STATE_DIR/apt-keyring-was-present"
 APT_SOURCE_INSTALLED_HASH="$STATE_DIR/apt-source-installed.sha256"
 APT_KEYRING_INSTALLED_HASH="$STATE_DIR/apt-keyring-installed.sha256"
 APT_TRANSACTION_ACTIVE="$STATE_DIR/apt-transaction-active"
+CADDY_PACKAGE_MARKER="$STATE_DIR/caddy-package-installed"
+CADDY_SERVICE_WAS_MASKED="$STATE_DIR/caddy-service-was-masked"
+RPM_COPR_MARKER="$STATE_DIR/caddy-copr-enabled"
 CADDY_GPG_FINGERPRINT="65760C51EDEA2017CEA2CA15155B6D79CA56EA34"
+CADDY_APT_REPOSITORY="https://dl.cloudsmith.io/public/caddy/stable/deb/debian"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -37,9 +41,8 @@ FORCE_YES=false
 SKIP_UPSTREAM_CHECK=false
 INTERACTIVE_MODE=true
 BACKEND_SCHEME=""
-BACKEND_HOST=""
-WEB_PORT_80_LISTENING=false
-WEB_PORT_443_LISTENING=false
+BACKEND_CANONICAL=""
+RUNTIME_FILES=()
 
 log()   { printf '%s %b %s\n' "$(date '+%F %T')" "${GREEN}[Info]${PLAIN}" "$1"; }
 warn()  { printf '%s %b %s\n' "$(date '+%F %T')" "${YELLOW}[Warning]${PLAIN}" "$1"; }
@@ -107,6 +110,38 @@ init_logging() {
     log "脚本日志：$LOG_FILE"
 }
 
+cleanup_runtime_files() {
+    local path
+
+    for path in "${RUNTIME_FILES[@]:-}"; do
+        [[ -n "$path" && -f "$path" && ! -L "$path" ]] || continue
+        rm -f -- "$path" 2>/dev/null || true
+    done
+}
+
+handle_termination() {
+    local exit_code="$1"
+
+    cleanup_runtime_files
+    trap - EXIT HUP INT TERM
+    exit "$exit_code"
+}
+
+track_runtime_file() {
+    RUNTIME_FILES+=("$1")
+}
+
+untrack_runtime_file() {
+    local target="$1"
+    local kept=()
+    local path
+
+    for path in "${RUNTIME_FILES[@]:-}"; do
+        [[ "$path" == "$target" ]] || kept+=("$path")
+    done
+    RUNTIME_FILES=("${kept[@]}")
+}
+
 with_config_lock() {
     local lock_fd
     local lock_file="$CADDY_DIR/.caddy-emby-manager.lock"
@@ -144,6 +179,35 @@ with_config_lock() {
         return 1
     fi
 
+    "$@"
+    result=$?
+    flock -u "$lock_fd" || true
+    eval "exec ${lock_fd}>&-"
+    return "$result"
+}
+
+with_global_lock() {
+    local lock_fd
+    local lock_file="/run/lock/caddy-emby-manager.lock"
+    local result
+
+    command -v flock >/dev/null 2>&1 || {
+        error "未找到 flock。请先安装 util-linux。"
+        return 1
+    }
+    [[ -d /run/lock && ! -L /run/lock ]] || {
+        error "全局锁目录不可用：/run/lock"
+        return 1
+    }
+    [[ ! -L "$lock_file" && ( ! -e "$lock_file" || -f "$lock_file" ) ]] || {
+        error "全局锁文件路径不安全：$lock_file"
+        return 1
+    }
+    exec {lock_fd}>"$lock_file" || return 1
+    flock -x "$lock_fd" || {
+        eval "exec ${lock_fd}>&-"
+        return 1
+    }
     "$@"
     result=$?
     flock -u "$lock_fd" || true
@@ -268,7 +332,8 @@ install_base() {
     log "正在检查基础组件..."
 
     if command -v apt-get >/dev/null 2>&1; then
-        packages=(curl wget sudo socat net-tools psmisc sed grep ca-certificates gnupg iproute2 util-linux tar)
+        packages=(curl sudo sed grep jq ca-certificates gnupg iproute2 util-linux tar)
+        command -v awk >/dev/null 2>&1 || packages+=(gawk)
         for package in "${packages[@]}"; do
             if package_installed_debian "$package"; then
                 log "$package 已安装，跳过"
@@ -291,7 +356,8 @@ install_base() {
             log "所有基础组件已安装"
         fi
     elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
-        packages=(curl wget sudo socat net-tools psmisc sed grep ca-certificates gnupg2 iproute util-linux tar)
+        packages=(curl sudo sed grep jq ca-certificates gnupg2 iproute util-linux tar)
+        command -v awk >/dev/null 2>&1 || packages+=(gawk)
         for package in "${packages[@]}"; do
             if package_installed_rpm "$package"; then
                 log "$package 已安装，跳过"
@@ -318,9 +384,193 @@ install_base() {
         fi
     else
         error "未检测到 apt-get、dnf 或 yum。"
-        log "请手动安装：curl wget sudo socat net-tools psmisc sed grep ca-certificates gnupg iproute util-linux tar"
+        log "请手动安装：curl sudo sed grep awk jq ca-certificates gnupg iproute util-linux tar"
         return 1
     fi
+}
+
+caddy_package_is_healthy() {
+    if command -v dpkg-query >/dev/null 2>&1 && package_installed_debian caddy; then
+        return 0
+    fi
+    if package_installed_rpm caddy; then
+        return 0
+    fi
+    return 1
+}
+
+prepare_caddy_service_unit() {
+    local enabled_state
+
+    command -v systemctl >/dev/null 2>&1 || return 0
+    enabled_state=$(systemctl is-enabled caddy 2>/dev/null || true)
+    [[ "$enabled_state" == masked ]] || return 0
+    ensure_state_dir || return 1
+    state_entry_is_safe "$CADDY_SERVICE_WAS_MASKED" || return 1
+    printf 'masked\n' > "$CADDY_SERVICE_WAS_MASKED" || return 1
+    systemctl unmask caddy >/dev/null 2>&1 || {
+        error "无法解除 caddy.service 的 masked 状态。"
+        return 1
+    }
+    log "已临时解除 caddy.service 的 masked 状态；卸载时会恢复。"
+}
+
+record_caddy_service_mask_state() {
+    local enabled_state
+
+    command -v systemctl >/dev/null 2>&1 || return 0
+    enabled_state=$(systemctl is-enabled caddy 2>/dev/null || true)
+    [[ "$enabled_state" == masked ]] || return 0
+    ensure_state_dir || return 1
+    state_entry_is_safe "$CADDY_SERVICE_WAS_MASKED" || return 1
+    printf 'masked\n' > "$CADDY_SERVICE_WAS_MASKED"
+}
+
+ensure_caddyfile_exists() {
+    local temporary
+
+    if [[ -f "$CADDYFILE" && ! -L "$CADDYFILE" ]]; then
+        return 0
+    fi
+    [[ ! -e "$CADDYFILE" && ! -L "$CADDYFILE" ]] || {
+        error "Caddyfile 路径不是可安全创建的普通文件：$CADDYFILE"
+        return 1
+    }
+    temporary=$(mktemp "$CADDY_DIR/.Caddyfile.initial.XXXXXX") || return 1
+    if ! printf '# Caddy Emby manager: add a site with --configure before starting Caddy.\n' > "$temporary" || \
+        ! chmod 644 "$temporary" || ! mv "$temporary" "$CADDYFILE"; then
+        rm -f "$temporary"
+        error "无法创建初始 Caddyfile。"
+        return 1
+    fi
+}
+
+restore_caddy_service_mask() {
+    [[ -f "$CADDY_SERVICE_WAS_MASKED" && ! -L "$CADDY_SERVICE_WAS_MASKED" ]] || return 0
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl mask caddy >/dev/null 2>&1
+}
+
+repair_managed_apt_asset_permissions() {
+    local path
+
+    for path in "$APT_SOURCE" "$APT_KEYRING"; do
+        [[ -f "$path" && ! -L "$path" ]] || {
+            error "本脚本管理的 apt 资产缺失或路径不安全：$path"
+            return 1
+        }
+        chmod 644 "$path" || return 1
+    done
+}
+
+cleanup_failed_caddy_package() {
+    if command -v apt-get >/dev/null 2>&1 && dpkg-query -W caddy >/dev/null 2>&1; then
+        apt-get remove -y caddy >/dev/null 2>&1 || dpkg --remove --force-remove-reinstreq caddy >/dev/null 2>&1 || true
+    elif package_installed_rpm caddy; then
+        if command -v dnf >/dev/null 2>&1; then
+            dnf remove -y caddy >/dev/null 2>&1 || true
+        elif command -v yum >/dev/null 2>&1; then
+            yum remove -y caddy >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+cleanup_failed_install_bookkeeping() {
+    local caddyfile_was_present="$1"
+    local service_marker_was_present="$2"
+
+    if [[ "$caddyfile_was_present" != true ]] && is_initial_managed_caddyfile "$CADDYFILE"; then
+        rm -f "$CADDYFILE" || true
+    fi
+    if [[ "$service_marker_was_present" != true && -f "$CADDY_SERVICE_WAS_MASKED" && ! -L "$CADDY_SERVICE_WAS_MASKED" ]]; then
+        restore_caddy_service_mask >/dev/null 2>&1 || true
+        rm -f "$CADDY_SERVICE_WAS_MASKED" || true
+    fi
+    rmdir "$STATE_DIR" 2>/dev/null || true
+}
+
+record_managed_caddy_package() {
+    local package_kind="$1"
+
+    ensure_state_dir || return 1
+    state_entry_is_safe "$CADDY_PACKAGE_MARKER" || return 1
+    printf '%s\n' "$package_kind" > "$CADDY_PACKAGE_MARKER"
+}
+
+validate_caddy_apt_source() {
+    local file="$1"
+    local line
+    local normalized
+    local binary_seen=0
+    local source_seen=0
+
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line=$(trim_whitespace "$line")
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        normalized=$(printf '%s' "$line" | tr -s '[:space:]' ' ')
+        case "$normalized" in
+            "deb [signed-by=$APT_KEYRING] $CADDY_APT_REPOSITORY any-version main")
+                ((binary_seen += 1))
+                ;;
+            "deb-src [signed-by=$APT_KEYRING] $CADDY_APT_REPOSITORY any-version main")
+                ((source_seen += 1))
+                ;;
+            *)
+                error "Caddy apt 源文件包含未授权内容：$line"
+                return 1
+                ;;
+        esac
+    done < "$file"
+    ((binary_seen == 1 && source_seen <= 1))
+}
+
+validate_caddy_apt_candidate() {
+    local policy
+    local candidate
+
+    command -v apt-cache >/dev/null 2>&1 || return 1
+    policy=$(apt-cache policy caddy 2>/dev/null) || return 1
+    candidate=$(awk '/^[[:space:]]*Candidate:/ { print $2; exit }' <<< "$policy")
+    [[ -n "$candidate" && "$candidate" != "(none)" ]] || return 1
+    apt-cache madison caddy 2>/dev/null | awk -F'|' -v candidate="$candidate" -v repository="$CADDY_APT_REPOSITORY" '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        trim($2) == candidate && index($3, repository) { found = 1 }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
+caddy_copr_is_enabled() {
+    local manager="$1"
+
+    "$manager" copr list --enabled 2>/dev/null | grep -Fq '@caddyserver/caddy'
+}
+
+enable_caddy_copr() {
+    local manager="$1"
+    local already_enabled=false
+
+    caddy_copr_is_enabled "$manager" && already_enabled=true
+    "$manager" copr enable @caddyserver/caddy -y || return 1
+    if [[ "$already_enabled" != true ]]; then
+        ensure_state_dir || return 1
+        state_entry_is_safe "$RPM_COPR_MARKER" || return 1
+        printf '%s\n' "$manager" > "$RPM_COPR_MARKER" || return 1
+    fi
+}
+
+disable_managed_caddy_copr() {
+    local manager
+
+    [[ -f "$RPM_COPR_MARKER" && ! -L "$RPM_COPR_MARKER" ]] || return 0
+    manager=$(<"$RPM_COPR_MARKER")
+    [[ "$manager" == dnf || "$manager" == yum ]] || return 1
+    command -v "$manager" >/dev/null 2>&1 || return 1
+    "$manager" copr disable @caddyserver/caddy -y
 }
 
 ensure_state_dir() {
@@ -453,16 +703,53 @@ record_apt_asset_hash() {
     printf '%s\n' "$hash" > "$hash_file"
 }
 
-install_caddy() {
+install_environment() {
+    with_global_lock install_environment_locked
+}
+
+install_environment_locked() {
+    install_base && with_config_lock install_caddy_locked
+}
+
+install_caddy_locked() {
     local key_download
     local source_download
     local key_stage
     local source_stage
+    local package_was_present=false
+    local managed_package_kind=""
+    local caddyfile_was_present=false
+    local service_marker_was_present=false
+
+    [[ -e "$CADDYFILE" || -L "$CADDYFILE" ]] && caddyfile_was_present=true
+    [[ -e "$CADDY_SERVICE_WAS_MASKED" || -L "$CADDY_SERVICE_WAS_MASKED" ]] && service_marker_was_present=true
+
+    if [[ -f "$CADDY_PACKAGE_MARKER" && ! -L "$CADDY_PACKAGE_MARKER" ]]; then
+        managed_package_kind=$(<"$CADDY_PACKAGE_MARKER")
+    fi
 
     if command -v caddy >/dev/null 2>&1; then
-        warn "Caddy 已安装。"
+        if ! caddy_package_is_healthy; then
+            error "检测到 caddy 命令，但包管理器状态不完整或安装来源无法确认。"
+            return 1
+        fi
+        if [[ "$managed_package_kind" == debian || "$managed_package_kind" == rpm ]]; then
+            log "本脚本安装的 Caddy 已存在，正在检查服务配置。"
+            if [[ "$managed_package_kind" == debian ]]; then
+                repair_managed_apt_asset_permissions || return 1
+            fi
+            ensure_caddyfile_exists || return 1
+            prepare_caddy_service_unit || return 1
+        else
+            warn "Caddy 已由系统包管理器安装，脚本不会取得该包的卸载归属。"
+        fi
         if command -v systemctl >/dev/null 2>&1; then
-            systemctl enable caddy >/dev/null 2>&1 || warn "无法设置 Caddy 开机自启。"
+            if [[ $(systemctl is-enabled caddy 2>/dev/null || true) != masked ]]; then
+                systemctl reset-failed caddy >/dev/null 2>&1 || true
+                systemctl enable caddy >/dev/null 2>&1 || warn "无法设置 Caddy 开机自启。"
+            else
+                warn "caddy.service 已被 mask，保留现状。"
+            fi
         fi
         return 0
     fi
@@ -473,57 +760,119 @@ install_caddy() {
     fi
 
     log "正在安装 Caddy..."
+    record_caddy_service_mask_state || return 1
     if command -v apt-get >/dev/null 2>&1; then
+        package_installed_debian caddy && package_was_present=true
         prepare_apt_assets || return 1
 
-        if ! apt-get install -y debian-keyring debian-archive-keyring apt-transport-https; then
+        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y debian-keyring debian-archive-keyring apt-transport-https; then
             error "Caddy 所需 apt 组件安装失败。"
             rollback_apt_transaction || true
+            cleanup_failed_install_bookkeeping "$caddyfile_was_present" "$service_marker_was_present"
             return 1
         fi
 
         key_download=$(mktemp "/tmp/caddy-key.XXXXXX") || {
             rollback_apt_transaction || true
+            cleanup_failed_install_bookkeeping "$caddyfile_was_present" "$service_marker_was_present"
             return 1
         }
+        track_runtime_file "$key_download"
         source_download=$(mktemp "/tmp/caddy-source.XXXXXX") || {
             rm -f "$key_download"
+            untrack_runtime_file "$key_download"
             rollback_apt_transaction || true
+            cleanup_failed_install_bookkeeping "$caddyfile_was_present" "$service_marker_was_present"
             return 1
         }
+        track_runtime_file "$source_download"
         key_stage=$(mktemp "$(dirname "$APT_KEYRING")/.caddy-keyring.XXXXXX") || {
             rm -f "$key_download" "$source_download"
+            untrack_runtime_file "$key_download"
+            untrack_runtime_file "$source_download"
             rollback_apt_transaction || true
+            cleanup_failed_install_bookkeeping "$caddyfile_was_present" "$service_marker_was_present"
             return 1
         }
+        track_runtime_file "$key_stage"
         source_stage=$(mktemp "$(dirname "$APT_SOURCE")/.caddy-source.XXXXXX") || {
             rm -f "$key_download" "$source_download" "$key_stage"
+            untrack_runtime_file "$key_download"
+            untrack_runtime_file "$source_download"
+            untrack_runtime_file "$key_stage"
             rollback_apt_transaction || true
+            cleanup_failed_install_bookkeeping "$caddyfile_was_present" "$service_marker_was_present"
             return 1
         }
+        track_runtime_file "$source_stage"
 
         if ! curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' -o "$key_download" || \
             ! curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' -o "$source_download" || \
-            ! gpg --batch --show-keys --with-colons "$key_download" | awk -F: -v expected="$CADDY_GPG_FINGERPRINT" '$1 == "fpr" && $10 == expected { found=1 } END { exit(found ? 0 : 1) }' || \
+            ! gpg --batch --show-keys --with-colons "$key_download" | awk -F: -v expected="$CADDY_GPG_FINGERPRINT" '
+                $1 == "pub" { public_keys += 1; primary_fingerprint = 1; next }
+                primary_fingerprint && $1 == "fpr" {
+                    if ($10 == expected) expected_primary = 1
+                    primary_fingerprint = 0
+                }
+                END { exit(public_keys == 1 && expected_primary ? 0 : 1) }
+            ' || \
             ! gpg --dearmor --yes -o "$key_stage" "$key_download" || \
+            ! validate_caddy_apt_source "$source_download" || \
             ! cp "$source_download" "$source_stage"; then
             error "Caddy 官方 apt 源或 keyring 下载/准备失败。"
             rm -f "$key_download" "$source_download" "$key_stage" "$source_stage"
+            untrack_runtime_file "$key_download"
+            untrack_runtime_file "$source_download"
+            untrack_runtime_file "$key_stage"
+            untrack_runtime_file "$source_stage"
             rollback_apt_transaction || true
+            cleanup_failed_install_bookkeeping "$caddyfile_was_present" "$service_marker_was_present"
             return 1
         fi
         rm -f "$key_download" "$source_download"
+        untrack_runtime_file "$key_download"
+        untrack_runtime_file "$source_download"
 
         if ! mv "$key_stage" "$APT_KEYRING" || ! mv "$source_stage" "$APT_SOURCE"; then
             error "Caddy apt 源或 keyring 写入失败。"
             rm -f "$key_stage" "$source_stage"
+            untrack_runtime_file "$key_stage"
+            untrack_runtime_file "$source_stage"
             rollback_apt_transaction || true
+            cleanup_failed_install_bookkeeping "$caddyfile_was_present" "$service_marker_was_present"
+            return 1
+        fi
+        untrack_runtime_file "$key_stage"
+        untrack_runtime_file "$source_stage"
+        ensure_caddyfile_exists || {
+            rollback_apt_transaction || true
+            cleanup_failed_install_bookkeeping "$caddyfile_was_present" "$service_marker_was_present"
+            return 1
+        }
+        if ! chmod 644 "$APT_KEYRING" "$APT_SOURCE"; then
+            error "无法设置 Caddy apt 源或 keyring 的读取权限。"
+            rollback_apt_transaction || true
+            cleanup_failed_install_bookkeeping "$caddyfile_was_present" "$service_marker_was_present"
             return 1
         fi
 
-        if ! apt-get update || ! apt-get install -y caddy; then
+        if ! apt-get update \
+            -o APT::Update::Error-Mode=any \
+            -o Acquire::AllowInsecureRepositories=false \
+            -o Acquire::AllowDowngradeToInsecureRepositories=false || \
+            ! validate_caddy_apt_candidate || \
+            ! DEBIAN_FRONTEND=noninteractive apt-get install -y caddy; then
             error "Caddy apt 安装失败，正在恢复原有 apt 源和 keyring。"
+            [[ "$package_was_present" == true ]] || cleanup_failed_caddy_package
             rollback_apt_transaction || true
+            cleanup_failed_install_bookkeeping "$caddyfile_was_present" "$service_marker_was_present"
+            return 1
+        fi
+        if ! caddy_package_is_healthy; then
+            error "Caddy apt 包安装后状态不完整，正在清理本次安装。"
+            [[ "$package_was_present" == true ]] || cleanup_failed_caddy_package
+            rollback_apt_transaction || true
+            cleanup_failed_install_bookkeeping "$caddyfile_was_present" "$service_marker_was_present"
             return 1
         fi
 
@@ -532,32 +881,55 @@ install_caddy() {
         record_apt_asset_hash "$APT_KEYRING" "$APT_KEYRING_INSTALLED_HASH" || \
             warn "无法记录 Caddy keyring 校验值，卸载时将保留该 keyring。"
         rm -f "$APT_TRANSACTION_ACTIVE"
+        if [[ "$package_was_present" != true ]]; then
+            record_managed_caddy_package debian || warn "无法记录 Caddy 包归属；卸载时将保留该包。"
+        fi
     elif command -v dnf >/dev/null 2>&1; then
+        package_installed_rpm caddy && package_was_present=true
+        ensure_caddyfile_exists || return 1
         dnf install -y 'dnf-command(copr)' >/dev/null 2>&1 || dnf install -y dnf-plugins-core || {
             error "Caddy COPR 插件安装失败。"
             return 1
         }
-        dnf copr enable @caddyserver/caddy -y || {
+        enable_caddy_copr dnf || {
             error "Caddy COPR 源启用失败。"
             return 1
         }
         dnf install -y caddy || {
             error "Caddy 安装失败。"
+            [[ "$package_was_present" == true ]] || cleanup_failed_caddy_package
+            disable_managed_caddy_copr >/dev/null 2>&1 || true
             return 1
         }
+        caddy_package_is_healthy || {
+            [[ "$package_was_present" == true ]] || cleanup_failed_caddy_package
+            disable_managed_caddy_copr >/dev/null 2>&1 || true
+            return 1
+        }
+        [[ "$package_was_present" == true ]] || record_managed_caddy_package rpm || warn "无法记录 Caddy 包归属；卸载时将保留该包。"
     elif command -v yum >/dev/null 2>&1; then
+        package_installed_rpm caddy && package_was_present=true
+        ensure_caddyfile_exists || return 1
         yum install -y yum-plugin-copr || {
             error "Caddy COPR 插件安装失败。"
             return 1
         }
-        yum copr enable @caddyserver/caddy -y || {
+        enable_caddy_copr yum || {
             error "Caddy COPR 源启用失败。"
             return 1
         }
         yum install -y caddy || {
             error "Caddy 安装失败。"
+            [[ "$package_was_present" == true ]] || cleanup_failed_caddy_package
+            disable_managed_caddy_copr >/dev/null 2>&1 || true
             return 1
         }
+        caddy_package_is_healthy || {
+            [[ "$package_was_present" == true ]] || cleanup_failed_caddy_package
+            disable_managed_caddy_copr >/dev/null 2>&1 || true
+            return 1
+        }
+        [[ "$package_was_present" == true ]] || record_managed_caddy_package rpm || warn "无法记录 Caddy 包归属；卸载时将保留该包。"
     else
         error "未找到支持的包管理器。"
         return 1
@@ -567,7 +939,10 @@ install_caddy() {
         error "Caddy 安装完成后仍无法找到 caddy 命令。"
         return 1
     fi
+    ensure_caddyfile_exists || return 1
+    prepare_caddy_service_unit || return 1
     if command -v systemctl >/dev/null 2>&1; then
+        systemctl reset-failed caddy >/dev/null 2>&1 || true
         systemctl enable caddy || warn "Caddy 已安装，但设置开机自启失败。"
     fi
     log "Caddy 安装完成！"
@@ -621,7 +996,11 @@ canonicalize_site_address() {
         host=$(canonicalize_domain "$host") || return 1
         validate_domain "$host" || return 1
         validate_port "$port" || return 1
-        printf "%s:%d" "$host" "$((10#$port))"
+        if ((10#$port == 443)); then
+            printf "%s" "$host"
+        else
+            printf "%s:%d" "$host" "$((10#$port))"
+        fi
     else
         host=$(canonicalize_domain "$value") || return 1
         validate_domain "$host" || return 1
@@ -744,6 +1123,8 @@ validate_backend() {
         hostport="$backend"
     fi
 
+    hostport="${hostport%/}"
+
     [[ -n "$hostport" && "$hostport" != */* && "$hostport" != *\?* && "$hostport" != *#* ]] || return 1
 
     if [[ "$hostport" =~ $bracketed_regex ]]; then
@@ -773,6 +1154,20 @@ validate_backend() {
     fi
 
     BACKEND_SCHEME="$scheme"
+    if [[ "$hostport" == \[* ]]; then
+        if [[ -n "$port" ]]; then
+            BACKEND_CANONICAL="[$host]:$((10#$port))"
+        else
+            BACKEND_CANONICAL="[$host]"
+        fi
+    elif [[ -n "$port" ]]; then
+        BACKEND_CANONICAL="${host,,}:$((10#$port))"
+    else
+        BACKEND_CANONICAL="${host,,}"
+    fi
+    if [[ "$scheme" == https ]]; then
+        BACKEND_CANONICAL="https://$BACKEND_CANONICAL"
+    fi
     return 0
 }
 
@@ -817,53 +1212,43 @@ list_configured_domains() {
             sub(/[[:space:]]+$/, "", value)
             return value
         }
-        function valid_label(value) {
-            return value ~ /^[A-Za-z0-9]([-A-Za-z0-9]*[A-Za-z0-9])?$/
-        }
-        function valid_domain(value, parts, count, part_index, start) {
-            value = trim(value)
-            sub(/\.$/, "", value)
-            if (length(value) == 0 || length(value) > 253 || value !~ /^(\*\.)?[A-Za-z0-9.-]+$/ || value !~ /\./ || value ~ /^\./ || value ~ /\.\./) return 0
-            count = split(value, parts, /[.]/)
-            start = 1
-            if (parts[1] == "*") {
-                if (count < 3) return 0
-                start = 2
-            }
-            for (part_index = start; part_index <= count; part_index++) {
-                if (length(parts[part_index]) == 0 || length(parts[part_index]) > 63 || !valid_label(parts[part_index])) return 0
-            }
-            return 1
-        }
-        function canonical_site_address(value, host, port, colon) {
-            value = trim(value)
-            port = ""
-            if (value ~ /:[0-9][0-9]*$/) {
-                colon = match(value, /:[0-9][0-9]*$/)
-                host = substr(value, 1, colon - 1)
-                port = substr(value, colon + 1)
-                if (length(port) > 5 || (port + 0) < 1 || (port + 0) > 65535) return ""
-            } else {
-                host = value
-            }
-            sub(/\.$/, "", host)
-            if (!valid_domain(host)) return ""
-            if (port != "") return tolower(host) ":" (port + 0)
-            return tolower(host)
-        }
-        {
+        /^[[:space:]]*#[[:space:]]+BEGIN[[:space:]]+CADDY-EMBY-MANAGED[[:space:]]+/ {
             line = trim($0)
-            open = index(line, "{")
-            if ($0 !~ /^[[:space:]]/ && open > 0) {
-                addresses = trim(substr(line, 1, open - 1))
-                address_count = split(addresses, address_parts, ",")
-                for (address_index = 1; address_index <= address_count; address_index++) {
-                    domain = canonical_site_address(address_parts[address_index])
-                    if (domain != "") print domain
-                }
-            }
+            sub(/^#[[:space:]]+BEGIN[[:space:]]+CADDY-EMBY-MANAGED[[:space:]]+/, "", line)
+            sub(/:443$/, "", line)
+            if (line != "") print tolower(line)
         }
     ' "$file" | sort -u
+}
+
+site_conflicts_with_existing_config() {
+    local target="$1"
+    local file="$2"
+    local adapted
+    local target_host="$target"
+    local target_port=443
+
+    if [[ "$target" =~ ^(.+):([0-9]+)$ ]]; then
+        target_host="${BASH_REMATCH[1]}"
+        target_port="$((10#${BASH_REMATCH[2]}))"
+    fi
+
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    command -v jq >/dev/null 2>&1 || {
+        error "缺少 jq，无法安全检测 Caddy 站点冲突。"
+        return 2
+    }
+    adapted=$(caddy adapt --config "$file" --adapter caddyfile 2>/dev/null) || return 2
+    jq -e --arg target "$target_host" --arg port "$target_port" '
+        [
+            .apps.http.servers // {}
+            | to_entries[]
+            | select(any(.value.listen[]?; endswith(":" + $port)))
+            | .value.routes[]?.match[]?.host[]?
+            | ascii_downcase
+            | select(. == ($target | ascii_downcase))
+        ] | length > 0
+    ' <<< "$adapted" >/dev/null
 }
 
 site_block_exists_in_file() {
@@ -878,69 +1263,30 @@ site_block_exists_in_file() {
             sub(/[[:space:]]+$/, "", value)
             return value
         }
-        function canonical_site_address(value, host, port, colon) {
-            value = trim(value)
-            port = ""
-            if (value ~ /:[0-9][0-9]*$/) {
-                colon = match(value, /:[0-9][0-9]*$/)
-                host = substr(value, 1, colon - 1)
-                port = substr(value, colon + 1)
-                if (length(port) > 5 || (port + 0) < 1 || (port + 0) > 65535) return ""
-            } else {
-                host = value
-            }
-            sub(/\.$/, "", host)
-            if (host == "") return ""
-            if (port != "") return tolower(host) ":" (port + 0)
-            return tolower(host)
-        }
-        function contains_target(addresses, parts, count, part_index, address, comparison) {
-            count = split(addresses, parts, ",")
-            for (part_index = 1; part_index <= count; part_index++) {
-                address = trim(parts[part_index])
-                comparison = canonical_site_address(address)
-                if (tolower(comparison) == target) return 1
-            }
-            return 0
-        }
         BEGIN {
             target = tolower(target)
             start = tolower("# BEGIN CADDY-EMBY-MANAGED " target)
             finish = tolower("# END CADDY-EMBY-MANAGED " target)
-            mode = "normal"
+            if (target !~ /:[0-9]+$/) {
+                alternate_start = start ":443"
+                alternate_finish = finish ":443"
+            }
         }
         {
-            line = trim($0)
-            line_lower = tolower(line)
-            if (mode == "marker") {
-                if (line_lower == finish) mode = "normal"
-                next
-            }
-            if (line_lower == start) {
+            line_lower = tolower(trim($0))
+            if (line_lower == start || (alternate_start != "" && line_lower == alternate_start)) {
+                if (inside) exit 2
                 found = 1
-                mode = "marker"
+                inside = 1
                 next
             }
-            if (mode == "legacy") {
-                open_count = gsub(/\{/ , "{", line)
-                close_count = gsub(/\}/, "}", line)
-                brace_depth += open_count - close_count
-                if (brace_depth <= 0) mode = "normal"
-                next
-            }
-            open = index(line_lower, "{")
-            if ($0 !~ /^[[:space:]]/ && open > 0 && contains_target(trim(substr(line_lower, 1, open - 1)))) {
-                found = 1
-                mode = "legacy"
-                open_count = gsub(/\{/, "{", line)
-                close_count = gsub(/\}/, "}", line)
-                brace_depth = open_count - close_count
-                if (brace_depth <= 0) mode = "normal"
+            if (inside && (line_lower == finish || (alternate_finish != "" && line_lower == alternate_finish))) {
+                inside = 0
                 next
             }
         }
         END {
-            if (mode != "normal") exit 2
+            if (inside) exit 2
             exit(found ? 0 : 1)
         }
     ' "$file"
@@ -960,97 +1306,31 @@ remove_site_block_from_file() {
             sub(/[[:space:]]+$/, "", value)
             return value
         }
-        function canonical_site_address(value, host, port, colon) {
-            value = trim(value)
-            port = ""
-            if (value ~ /:[0-9][0-9]*$/) {
-                colon = match(value, /:[0-9][0-9]*$/)
-                host = substr(value, 1, colon - 1)
-                port = substr(value, colon + 1)
-                if (length(port) > 5 || (port + 0) < 1 || (port + 0) > 65535) return ""
-            } else {
-                host = value
-            }
-            sub(/\.$/, "", host)
-            if (host == "") return ""
-            if (port != "") return tolower(host) ":" (port + 0)
-            return tolower(host)
-        }
-        function contains_target(addresses, parts, count, part_index, address, comparison) {
-            count = split(addresses, parts, ",")
-            for (part_index = 1; part_index <= count; part_index++) {
-                address = trim(parts[part_index])
-                comparison = canonical_site_address(address)
-                if (tolower(comparison) == target) return 1
-            }
-            return 0
-        }
-        function without_target(addresses, parts, count, part_index, address, comparison, result, kept) {
-            count = split(addresses, parts, ",")
-            result = ""
-            kept = 0
-            for (part_index = 1; part_index <= count; part_index++) {
-                address = trim(parts[part_index])
-                comparison = canonical_site_address(address)
-                if (tolower(comparison) == target) continue
-                if (kept++) result = result ", "
-                result = result address
-            }
-            return result
-        }
         BEGIN {
             target = tolower(target)
             start = tolower("# BEGIN CADDY-EMBY-MANAGED " target)
             finish = tolower("# END CADDY-EMBY-MANAGED " target)
-            mode = "normal"
+            if (target !~ /:[0-9]+$/) {
+                alternate_start = start ":443"
+                alternate_finish = finish ":443"
+            }
         }
         {
-            line = trim($0)
-            line_lower = tolower(line)
-            if (mode == "marker") {
-                if (line_lower == finish) mode = "normal"
+            line_lower = tolower(trim($0))
+            if (inside) {
+                if (line_lower == finish || (alternate_finish != "" && line_lower == alternate_finish)) inside = 0
                 next
             }
-            if (mode == "retained") {
-                print $0
-                open_count = gsub(/\{/, "{", line)
-                close_count = gsub(/\}/, "}", line)
-                brace_depth += open_count - close_count
-                if (brace_depth <= 0) mode = "normal"
-                next
-            }
-            if (mode == "legacy") {
-                open_count = gsub(/\{/ , "{", line)
-                close_count = gsub(/\}/, "}", line)
-                brace_depth += open_count - close_count
-                if (brace_depth <= 0) mode = "normal"
-                next
-            }
-            if (line_lower == start) {
+            if (line_lower == start || (alternate_start != "" && line_lower == alternate_start)) {
+                if (inside) exit 2
                 found = 1
-                mode = "marker"
-                next
-            }
-            open = index(line, "{")
-            if ($0 !~ /^[[:space:]]/ && open > 0 && contains_target(trim(substr(line, 1, open - 1)))) {
-                found = 1
-                remaining_addresses = without_target(trim(substr(line, 1, open - 1)))
-                if (remaining_addresses != "") {
-                    print remaining_addresses " " substr(line, open)
-                    mode = "retained"
-                } else {
-                    mode = "legacy"
-                }
-                open_count = gsub(/\{/ , "{", line)
-                close_count = gsub(/\}/, "}", line)
-                brace_depth = open_count - close_count
-                if (brace_depth <= 0) mode = "normal"
+                inside = 1
                 next
             }
             print
         }
         END {
-            if (mode != "normal") exit 2
+            if (inside) exit 2
             exit(found ? 0 : 1)
         }
     ' "$source" > "$output"
@@ -1087,28 +1367,6 @@ create_backup() {
     printf '%s' "$backup"
 }
 
-reject_wildcard_cors() {
-    local file="$1"
-
-    if awk '
-        /^[[:space:]]*#/ { next }
-        {
-            line = $0
-            gsub(/[";,]/, "", line)
-            line = tolower(line)
-            if (line ~ /^[[:space:]]*match[[:space:]]+header[[:space:]]+access-control-allow-origin[[:space:]]+\*[[:space:]]*$/) next
-            if (line ~ /(^|[[:space:]])[+-]?access-control-allow-origin[[:space:]]*([:=][[:space:]]*)?[[:space:]]*\*/) {
-                found = 1
-            }
-        }
-        END { exit(found ? 1 : 0) }
-    ' "$file"; then
-        return 0
-    fi
-    error "配置包含通配 CORS（Access-Control-Allow-Origin *），为避免向所有来源开放访问而拒绝应用。"
-    return 1
-}
-
 validate_caddyfile_syntax() {
     local file="$1"
 
@@ -1131,7 +1389,6 @@ validate_caddyfile() {
         error "Caddyfile 不存在：$file"
         return 1
     }
-    reject_wildcard_cors "$file" || return 1
     validate_caddyfile_syntax "$file"
 }
 
@@ -1174,7 +1431,7 @@ reload_caddy_locked() {
     log "Caddy reload 前的服务状态："
     log_caddy_state || true
     if systemctl is-active --quiet caddy; then
-        log "正在平滑重载 Caddy（不主动中断现有连接）..."
+        log "正在平滑重载 Caddy；WebSocket 客户端可能短暂重连..."
        if ! systemctl reload caddy; then
            error "Caddy 重载失败，保留原服务状态。"
            show_service_failure
@@ -1206,7 +1463,7 @@ reload_caddy_locked() {
 }
 
 reload_caddy() {
-    with_config_lock reload_caddy_locked "$@"
+    with_global_lock with_config_lock reload_caddy_locked
 }
 
 restore_service_state() {
@@ -1352,23 +1609,13 @@ apply_candidate() {
 print_config_block() {
     local domain="$1"
     local backend="$2"
-    local host_header=""
-
-    if [[ "$BACKEND_SCHEME" == https ]]; then
-        host_header="        header_up Host {upstream_hostport}"
-    fi
 
     cat <<EOF
 # BEGIN CADDY-EMBY-MANAGED $domain
 $domain {
     encode gzip
 
-    header -Access-Control-Allow-Origin {
-        match header Access-Control-Allow-Origin *
-    }
-
     reverse_proxy $backend {
-$host_header
         header_up X-Real-IP {remote_host}
     }
 }
@@ -1383,11 +1630,16 @@ configure_site_locked() {
     local candidate
     local without_old
     local source_status
+    local conflict_status
 
     domain=$(canonicalize_site_address "$1") || {
         error "站点地址格式无效，请输入类似 emby.example.com 或 emby.example.com:8443 的地址。"
         return 1
     }
+    if [[ "$domain" == \*.* ]]; then
+        error "暂不支持通配符站点。通配符证书需要额外的 DNS Challenge 配置。"
+        return 1
+    fi
     backend=$(trim_whitespace "$2")
     [[ -n "$backend" ]] || backend="127.0.0.1:8096"
 
@@ -1399,6 +1651,7 @@ configure_site_locked() {
         error "后端地址格式无效。支持：127.0.0.1:8096、https://remote.example.com:443、[::1]:8096。"
         return 1
     }
+    backend="$BACKEND_CANONICAL"
     command -v caddy >/dev/null 2>&1 || {
         error "未找到 Caddy，请先执行安装选项或 --install。"
         return 1
@@ -1456,6 +1709,18 @@ configure_site_locked() {
             rm -f "$candidate"
             error "无法判断域名 $domain 的配置块状态。"
             return 1
+        else
+            site_conflicts_with_existing_config "$domain" "$candidate"
+            conflict_status=$?
+            if ((conflict_status == 0)); then
+                rm -f "$candidate"
+                error "现有 Caddyfile 已包含域名 $domain 的非托管路由；为避免重复匹配，拒绝追加。"
+                return 1
+            elif ((conflict_status == 2)); then
+                rm -f "$candidate"
+                error "无法检测域名 $domain 是否与现有 Caddy 配置冲突。"
+                return 1
+            fi
         fi
 
         if [[ -s "$candidate" ]]; then
@@ -1475,7 +1740,7 @@ configure_site_locked() {
 }
 
 configure_site() {
-    with_config_lock configure_site_locked "$@"
+    with_global_lock with_config_lock configure_site_locked "$@"
 }
 
 configure_caddy() {
@@ -1578,20 +1843,21 @@ delete_site_locked() {
 
     after_content=$(grep -q '[^[:space:]]' "$candidate" 2>/dev/null; echo $?)
     if ((remaining == 0 && after_content != 0)); then
-        apply_candidate "$candidate" true
+        if apply_candidate "$candidate" true; then
+            log "域名配置删除完成。"
+            return 0
+        fi
     else
-        apply_candidate "$candidate"
-    fi
-
-    if [[ $? -eq 0 ]]; then
-        log "域名配置删除完成。"
-        return 0
+        if apply_candidate "$candidate"; then
+            log "域名配置删除完成。"
+            return 0
+        fi
     fi
     return 1
 }
 
 delete_site() {
-    with_config_lock delete_site_locked "$@"
+    with_global_lock with_config_lock delete_site_locked "$@"
 }
 
 delete_config() {
@@ -1688,11 +1954,6 @@ filter_web_ports() {
 
 check_port() {
     local listeners=""
-    local listener
-    local local_port
-
-    WEB_PORT_80_LISTENING=false
-    WEB_PORT_443_LISTENING=false
 
     echo -e "------------------------------------------------"
     echo -e "${SKYBLUE}正在查询 80 和 443 端口监听情况...${PLAIN}"
@@ -1702,15 +1963,6 @@ check_port() {
     fi
     listeners=$(printf '%s\n' "$listeners" | filter_web_ports)
 
-    while IFS= read -r listener; do
-        [[ -n "$listener" ]] || continue
-        local_port=$(printf '%s\n' "$listener" | awk '{ address = $4; sub(/^.*:/, "", address); print address }')
-        case "$local_port" in
-            80) WEB_PORT_80_LISTENING=true ;;
-            443) WEB_PORT_443_LISTENING=true ;;
-        esac
-    done <<< "$listeners"
-
     if [[ -n "$listeners" ]]; then
         printf '%s\n' "$listeners"
     else
@@ -1719,6 +1971,36 @@ check_port() {
     echo -e "------------------------------------------------"
     echo -e "显示 caddy 属于正常现象；其他服务请确认后再处理。"
     return 0
+}
+
+list_managed_listen_ports() {
+    local site
+    local port
+
+    printf '80\n'
+    while IFS= read -r site; do
+        if [[ "$site" =~ :([0-9]+)$ ]]; then
+            port="${BASH_REMATCH[1]}"
+        else
+            port=443
+        fi
+        printf '%d\n' "$((10#$port))"
+    done < <(list_configured_domains "$CADDYFILE")
+}
+
+tcp_port_is_listening() {
+    local expected="$1"
+    local listeners
+
+    listeners=$(list_tcp_listeners false) || return 1
+    printf '%s\n' "$listeners" | awk -v expected="$expected" '
+        function port(address) {
+            sub(/^.*:/, "", address)
+            return address
+        }
+        ($1 == "LISTEN" || $6 == "LISTEN") && port($4) == expected { found=1 }
+        END { exit(found ? 0 : 1) }
+    '
 }
 
 systemd_unit_loaded() {
@@ -1765,6 +2047,10 @@ kill_port() {
 }
 
 stop_caddy() {
+    with_global_lock with_config_lock stop_caddy_locked
+}
+
+stop_caddy_locked() {
     command -v systemctl >/dev/null 2>&1 || {
         error "未找到 systemctl。"
         return 1
@@ -1792,14 +2078,19 @@ show_config() {
 
 check_status() {
     local result=0
+    local port
+    local expected_ports=()
 
     check_port || result=1
-    if [[ "$WEB_PORT_80_LISTENING" != true || "$WEB_PORT_443_LISTENING" != true ]]; then
-        warn "未同时检测到 80 和 443 监听。"
-        result=1
-    fi
     if [[ -f "$CADDYFILE" && -s "$CADDYFILE" ]]; then
         validate_caddyfile "$CADDYFILE" || result=1
+        mapfile -t expected_ports < <(list_managed_listen_ports | sort -nu)
+        for port in "${expected_ports[@]}"; do
+            if ! tcp_port_is_listening "$port"; then
+                warn "未检测到托管站点所需的 TCP $port 端口监听。"
+                result=1
+            fi
+        done
     else
         warn "Caddyfile 不存在或为空。"
         result=1
@@ -1918,6 +2209,14 @@ is_fully_managed_caddyfile() {
     ' "$file"
 }
 
+is_initial_managed_caddyfile() {
+    local file="$1"
+
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    [[ "$(wc -l < "$file" 2>/dev/null)" =~ ^[[:space:]]*1[[:space:]]*$ ]] || return 1
+    grep -Fqx '# Caddy Emby manager: add a site with --configure before starting Caddy.' "$file" 2>/dev/null
+}
+
 cleanup_caddy_files() {
     local path
     local result=0
@@ -1931,7 +2230,7 @@ cleanup_caddy_files() {
         return 1
     fi
     [[ -d "$CADDY_DIR" ]] || return 0
-    if is_fully_managed_caddyfile "$CADDYFILE"; then
+    if is_fully_managed_caddyfile "$CADDYFILE" || is_initial_managed_caddyfile "$CADDYFILE"; then
         rm -f "$CADDYFILE" || result=1
     elif [[ -e "$CADDYFILE" ]]; then
         warn "Caddyfile 含有未管理内容，保留：$CADDYFILE"
@@ -1939,7 +2238,7 @@ cleanup_caddy_files() {
     fi
     for path in "$CADDY_DIR"/.caddy-emby-manager-Caddyfile.bak.* "$CADDY_DIR"/.Caddyfile.candidate.* \
         "$CADDY_DIR"/.Caddyfile.without.* "$CADDY_DIR"/.Caddyfile.delete.* \
-        "$CADDY_DIR"/.Caddyfile.restore.*; do
+        "$CADDY_DIR"/.Caddyfile.restore.* "$CADDY_DIR"/.Caddyfile.initial.*; do
         [[ -f "$path" && ! -L "$path" ]] || continue
         rm -f "$path" || result=1
     done
@@ -1980,7 +2279,8 @@ cleanup_manager_state() {
     for path in "$ALIAS_MARKER" "$APT_SOURCE_BACKUP" "$APT_KEYRING_BACKUP" \
         "$APT_SOURCE_WAS_PRESENT" "$APT_KEYRING_WAS_PRESENT" \
         "$APT_SOURCE_INSTALLED_HASH" "$APT_KEYRING_INSTALLED_HASH" \
-        "$APT_TRANSACTION_ACTIVE"; do
+        "$APT_TRANSACTION_ACTIVE" "$CADDY_PACKAGE_MARKER" \
+        "$CADDY_SERVICE_WAS_MASKED" "$RPM_COPR_MARKER"; do
         [[ -e "$path" ]] || continue
         if [[ -L "$path" || ! -f "$path" ]]; then
             warn "状态目录中存在无法确认归属的条目，保留：$path"
@@ -2120,19 +2420,30 @@ uninstall_caddy_locked() {
     local package_kind="none"
     local package_removed=false
     local cleanup_result=0
+    local managed_package_kind=""
 
-    echo -e "${RED}卸载会先归档 /etc/caddy 和 /var/lib/caddy，再停止并移除 Caddy；未确认归属的数据目录会保留。${PLAIN}"
+    echo -e "${RED}卸载会先停止 Caddy，再归档 /etc/caddy 和 /var/lib/caddy；只移除本脚本安装的包。${PLAIN}"
     if ! confirm_action "确认完整卸载吗?"; then
         log "已取消卸载。"
         return 1
     fi
+    if [[ -f "$CADDY_PACKAGE_MARKER" && ! -L "$CADDY_PACKAGE_MARKER" ]]; then
+        managed_package_kind=$(<"$CADDY_PACKAGE_MARKER")
+    fi
     if command -v dpkg-query >/dev/null 2>&1 && package_installed_debian caddy; then
-        package_kind="debian"
+        if [[ "$managed_package_kind" == debian ]]; then
+            package_kind="debian"
+        else
+            warn "Caddy apt 包不是由本脚本安装，卸载时保留该包。"
+        fi
     elif package_installed_rpm caddy; then
-        package_kind="rpm"
+        if [[ "$managed_package_kind" == rpm ]]; then
+            package_kind="rpm"
+        else
+            warn "Caddy rpm 包不是由本脚本安装，卸载时保留该包。"
+        fi
     elif command -v caddy >/dev/null 2>&1; then
-        error "检测到手动安装的 caddy，但脚本无法安全识别其安装来源；未删除配置。"
-        return 1
+        warn "检测到手动安装的 caddy，卸载时保留该二进制。"
     fi
     if [[ "$package_kind" == debian ]] && ! command -v apt-get >/dev/null 2>&1; then
         error "未找到 apt-get，无法卸载 Caddy apt 包。"
@@ -2142,13 +2453,13 @@ uninstall_caddy_locked() {
         error "未找到 dnf 或 yum，无法卸载 Caddy rpm 包。"
         return 1
     fi
-    archive_caddy_data || return 1
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet caddy; then
         if ! systemctl stop caddy || systemctl is-active --quiet caddy; then
             error "Caddy 停止失败，已取消卸载。"
             return 1
         fi
     fi
+    archive_caddy_data || return 1
 
     if [[ "$package_kind" == debian ]]; then
         if ! apt-get remove -y caddy; then
@@ -2173,7 +2484,7 @@ uninstall_caddy_locked() {
         fi
         package_removed=true
     else
-        warn "未检测到已安装的 Caddy 包，仅继续清理脚本创建的配置。"
+        warn "未检测到由本脚本安装的 Caddy 包，仅继续清理脚本创建的配置。"
         package_removed=true
     fi
 
@@ -2198,6 +2509,14 @@ uninstall_caddy_locked() {
                 cleanup_result=1
             fi
         fi
+        if ! disable_managed_caddy_copr; then
+            warn "无法禁用本脚本启用的 Caddy COPR 源。"
+            cleanup_result=1
+        fi
+        if ! restore_caddy_service_mask; then
+            warn "无法恢复 caddy.service 原有的 masked 状态。"
+            cleanup_result=1
+        fi
     fi
 
     cleanup_caddy_files || cleanup_result=1
@@ -2210,7 +2529,6 @@ uninstall_caddy_locked() {
             fi
         else
             warn "$SCRIPT_DEST 不是本脚本创建的文件，保留它。"
-            cleanup_result=1
         fi
     fi
     if is_managed_shortcut_file "$SHORTCUT"; then
@@ -2237,7 +2555,7 @@ uninstall_caddy_locked() {
 uninstall_caddy() {
     # Keep the lock pathname stable. Removing it after releasing flock can
     # race with another process that has already opened and locked the file.
-    with_config_lock uninstall_caddy_locked "$@"
+    with_global_lock with_config_lock uninstall_caddy_locked
 }
 
 run_cli() {
@@ -2250,7 +2568,7 @@ run_cli() {
     case "$command" in
         --install)
             [[ $# -eq 1 ]] || { error "--install 不接受额外参数。"; return 1; }
-            if install_base && install_caddy; then
+            if install_environment; then
                 register_shortcut || true
             else
                 return 1
@@ -2373,8 +2691,8 @@ show_menu() {
     }
 
     case "$number" in
-        1) install_base && install_caddy; action_result=$? ;;
-        2) install_base && install_caddy && configure_caddy; action_result=$? ;;
+        1) install_environment; action_result=$? ;;
+        2) install_environment && configure_caddy; action_result=$? ;;
         3) delete_config; action_result=$? ;;
         4) show_config; action_result=$? ;;
         5) stop_caddy; action_result=$? ;;
@@ -2389,6 +2707,11 @@ show_menu() {
 }
 
 main() {
+    trap cleanup_runtime_files EXIT
+    trap 'handle_termination 129' HUP
+    trap 'handle_termination 130' INT
+    trap 'handle_termination 143' TERM
+
     if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then
         usage
         return 0
